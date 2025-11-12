@@ -219,6 +219,19 @@ async def predict_and_avoid(city: str):
 # =====================================================
 # 🌍 تشغيل السيرفر (على Render)
 # =====================================================
+@app.get("/")
+def home():
+    return {
+        "status": "✅ Server Online",
+        "message": "UAV Cloud Simulation API is running successfully!",
+        "available_endpoints": [
+            "/city/{city}/uav  → PUT (upload UAV data)",
+            "/city/{city}/uavs → GET (retrieve UAVs)",
+            "/city/{city}/process → POST (analyze collisions)",
+            "/city/{city}/predict → POST (predict & avoid collisions)"
+        ]
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=10000)
