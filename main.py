@@ -95,6 +95,74 @@ async def get_uavs(city: str, system_case: str=None):
         session.close()
 
 @app.post("/city/{city}/process")
+# =====================================================
+# 🤖 تنبؤ التصادمات + تجنّبها (Cloud Analytics)
+# =====================================================
+from math import sqrt, cos, sin, pi
+import numpy as np
+
+@app.post("/city/{city}/predict")
+async def predict_and_avoid(city: str):
+    session = SessionLocal()
+    start = time.time()
+    try:
+        uavs = session.query(uav_table).filter_by(city_name=city).all()
+        n = len(uavs)
+        if n == 0:
+            return {"message": "No UAVs found for prediction."}
+
+        Δt = 5.0  # زمن التنبؤ (ثوانٍ)
+        collision_threshold = 0.05  # مسافة الخطر (درجات تقريباً ~5م)
+        collision_pairs = []
+        adjusted = []
+
+        # توليد اتجاه عشوائي وسرعة مستقبلية
+        for u in uavs:
+            angle = random.uniform(0, 2 * pi)
+            u.vx = u.speed * cos(angle) / 100
+            u.vy = u.speed * sin(angle) / 100
+            u.x_future = u.x + u.vx * Δt
+            u.y_future = u.y + u.vy * Δt
+
+        # 🔍 التنبؤ بالتصادمات
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = sqrt(
+                    (uavs[i].x_future - uavs[j].x_future) ** 2 +
+                    (uavs[i].y_future - uavs[j].y_future) ** 2
+                )
+                if dist < collision_threshold:
+                    collision_pairs.append([uavs[i].uav_id, uavs[j].uav_id])
+                    # تعديل الارتفاع لتجنّب التصادم
+                    uavs[i].altitude += 10
+                    uavs[j].altitude -= 10
+                    adjusted.append((uavs[i].uav_id, uavs[j].uav_id))
+
+        # تحديث قاعدة البيانات
+        for u in uavs:
+            stmt = uav_table.update().where(
+                (uav_table.c.city_name == city) &
+                (uav_table.c.uav_id == u.uav_id)
+            ).values(
+                x=u.x_future,
+                y=u.y_future,
+                altitude=u.altitude,
+                system_case="avoidance" if u.uav_id in sum(collision_pairs, ()) else "normal"
+            )
+            session.execute(stmt)
+        session.commit()
+
+        elapsed_ms = (time.time() - start) * 1000
+        return {
+            "processed_uavs": n,
+            "predicted_collisions": len(collision_pairs),
+            "adjusted_pairs": len(adjusted),
+            "collision_pairs": collision_pairs,
+            "execution_time_ms": round(elapsed_ms, 2)
+        }
+    finally:
+        session.close()
+
 async def process_uavs(city: str, system_case: str=None):
     session = SessionLocal()
     start = time.time()
