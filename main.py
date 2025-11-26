@@ -1,237 +1,238 @@
-# =====================================================
-# 🚀 UAV Simulation Server (Online Ready - Cloud Analytics)
-# =====================================================
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, String, MetaData, Table
-from sqlalchemy.orm import sessionmaker
-import time, random, asyncio
-from math import sqrt, cos, sin, pi
-import numpy as np
+from sqlalchemy import create_engine, Column, Integer, Float, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+from math import sqrt, atan2, cos, sin, pi
+import random
 
-# -------------------------------
-# 🛰️ نموذج بيانات UAV
-# -------------------------------
-class UAV(BaseModel):
+# =====================================================
+# Config
+# =====================================================
+CITIES = ["Baghdad", "Basra"]
+
+X_MIN, X_MAX = 33.0, 33.6
+Y_MIN, Y_MAX = 44.1, 44.7
+
+STEP_SCALE = 0.00012
+COLLISION_THRESHOLD = 0.05
+NEAR_FACTOR = 2
+
+# =====================================================
+# DB Setup
+# =====================================================
+engine = create_engine("sqlite:///multicity.sqlite",
+                       connect_args={"check_same_thread": False})
+Session = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+class UAV(Base):
+    __tablename__ = "uavs"
+
+    uav_id      = Column(Integer, primary_key=True)
+    city        = Column(String)     # Baghdad or Basra
+    x           = Column(Float)
+    y           = Column(Float)
+    altitude    = Column(Float)
+    speed       = Column(Float)
+    direction   = Column(Float)
+    system_case = Column(String)     # normal / avoidance / transfer
+    target_city = Column(String)
+    progress    = Column(Float)
+
+Base.metadata.create_all(engine)
+
+app = FastAPI()
+
+
+# =====================================================
+# Pydantic Model
+# =====================================================
+class UAVInput(BaseModel):
     uav_id: int
     x: float
     y: float
     altitude: float
     speed: float
-    system_case: str  # normal, avoidance
+    system_case: str = "normal"
+    target_city: str | None = None
+    progress: float = 0
 
-# -------------------------------
-# ⚙️ إعداد قاعدة بيانات SQLite
-# -------------------------------
-engine = create_engine("sqlite:///uav_db_full.sqlite", connect_args={"check_same_thread": False})
-metadata = MetaData()
-
-uav_table = Table(
-    "uavs", metadata,
-    Column("uav_id", Integer, primary_key=True),
-    Column("city_name", String, index=True),
-    Column("x", Float),
-    Column("y", Float),
-    Column("altitude", Float),
-    Column("speed", Float),
-    Column("system_case", String)
-)
-metadata.create_all(engine)
-SessionLocal = sessionmaker(bind=engine)
-
-# -------------------------------
-# 🖥️ إعداد FastAPI server
-# -------------------------------
-app = FastAPI(title="UAV Simulation Server (Online + Cloud Analytics)")
 
 # =====================================================
-# 🛰️ رفع بيانات الطائرات (PUT)
+# Helper functions
+# =====================================================
+def dist3(u1, u2):
+    return sqrt(
+        (u1.x - u2.x)**2 +
+        (u1.y - u2.y)**2 +
+        ((u1.altitude - u2.altitude)/100)**2
+    )
+
+def clamp_position(u):
+    u.x = min(max(u.x, X_MIN), X_MAX)
+    u.y = min(max(u.y, Y_MIN), Y_MAX)
+
+
+# =====================================================
+# RESET
+# =====================================================
+@app.delete("/reset")
+def reset_all():
+    s = Session()
+    s.query(UAV).delete()
+    s.commit()
+    return {"reset": True}
+
+
+# =====================================================
+# UPLOAD to city
 # =====================================================
 @app.put("/city/{city}/uav")
-async def put_uav(city: str, data: UAV):
-    session = SessionLocal()
-    start = time.time()
-    try:
-        existing = session.query(uav_table).filter_by(city_name=city, uav_id=data.uav_id).first()
-        if existing:
-            stmt = uav_table.update().where(
-                (uav_table.c.city_name == city) & (uav_table.c.uav_id == data.uav_id)
-            ).values(
-                x=data.x, y=data.y,
-                altitude=data.altitude,
-                speed=data.speed,
-                system_case=data.system_case
-            )
-            session.execute(stmt)
-        else:
-            stmt = uav_table.insert().values(
-                city_name=city,
-                uav_id=data.uav_id,
-                x=data.x,
-                y=data.y,
-                altitude=data.altitude,
-                speed=data.speed,
-                system_case=data.system_case
-            )
-            session.execute(stmt)
-        session.commit()
-        elapsed_ms = (time.time() - start) * 1000
-        return {"status": "ok", "put_time_ms": round(elapsed_ms, 3)}
-    finally:
-        session.close()
+def put_uav(city: str, u: UAVInput):
+    if city not in CITIES:
+        return {"error": "unknown city"}
+
+    s = Session()
+    r = s.query(UAV).filter(UAV.uav_id == u.uav_id).first()
+
+    if not r:
+        r = UAV(
+            uav_id=u.uav_id,
+            city=city,
+            x=u.x, y=u.y,
+            altitude=u.altitude,
+            speed=u.speed,
+            direction=random.uniform(-pi, pi),
+            system_case=u.system_case,
+            target_city=u.target_city,
+            progress=u.progress,
+        )
+        s.add(r)
+    else:
+        r.city = city
+        r.x = u.x
+        r.y = u.y
+        r.altitude = u.altitude
+        r.speed = u.speed
+        r.system_case = u.system_case
+        r.target_city = u.target_city
+        r.progress = u.progress
+
+    s.commit()
+    return {"ok": True}
+
 
 # =====================================================
-# 📦 استرجاع بيانات الطائرات (GET)
+# LIST UAVs in City
 # =====================================================
 @app.get("/city/{city}/uavs")
-async def get_uavs(city: str, system_case: str = None):
-    session = SessionLocal()
-    start = time.time()
-    try:
-        query = session.query(uav_table).filter_by(city_name=city)
-        if system_case:
-            query = query.filter_by(system_case=system_case)
-        uavs = query.all()
-        elapsed_ms = (time.time() - start) * 1000
-        approx_db_kb = round(len(uavs) * 0.5, 2)
-        return {
-            "uavs": [
-                {
-                    "uav_id": u.uav_id,
-                    "x": u.x,
-                    "y": u.y,
-                    "altitude": u.altitude,
-                    "speed": u.speed,
-                    "system_case": u.system_case,
-                }
-                for u in uavs
-            ],
-            "get_time_ms": round(elapsed_ms, 3),
-            "db_size_kb": approx_db_kb,
-        }
-    finally:
-        session.close()
+def get_city(city: str):
+    if city not in CITIES:
+        return {"uavs": []}
+    s = Session()
+    rows = s.query(UAV).filter(UAV.city == city).all()
+    return {"uavs": [{
+        "uav_id": r.uav_id,
+        "city": r.city,
+        "x": r.x,
+        "y": r.y,
+        "altitude": r.altitude,
+        "speed": r.speed,
+        "direction": r.direction,
+        "system_case": r.system_case,
+        "target_city": r.target_city,
+        "progress": r.progress
+    } for r in rows]}
+
 
 # =====================================================
-# ⚙️ معالجة البيانات العادية (POST)
+# TRANSFER Baghdad → Basra
+# =====================================================
+@app.post("/transfer")
+def transfer_uav(req: dict):
+    uav_id = req["uav_id"]
+    from_city = req["from_city"]
+    to_city = req["to_city"]
+
+    s = Session()
+    row = s.query(UAV).filter(UAV.uav_id == uav_id).first()
+    if not row:
+        return {"error": "not found"}
+
+    row.system_case = "transfer"
+    row.target_city = to_city
+    row.progress = 0.0
+
+    s.commit()
+    return {"transfer": True}
+
+
+# =====================================================
+# PROCESS movement
 # =====================================================
 @app.post("/city/{city}/process")
-async def process_uavs(city: str, system_case: str = None):
-    session = SessionLocal()
-    start = time.time()
-    try:
-        query = session.query(uav_table).filter_by(city_name=city)
-        if system_case:
-            query = query.filter_by(system_case=system_case)
-        uavs = query.all()
-        n = len(uavs)
-        collision_pairs = []
+def process_city(city: str):
 
-        # كشف التصادم (distance < 5)
-        for i in range(n):
-            for j in range(i + 1, n):
-                dx = uavs[i].x - uavs[j].x
-                dy = uavs[i].y - uavs[j].y
-                if (dx**2 + dy**2) ** 0.5 < 5:
-                    collision_pairs.append([uavs[i].uav_id, uavs[j].uav_id])
+    s = Session()
+    rows = s.query(UAV).filter(UAV.city == city).all()
 
-        # محاكاة زمن المعالجة
-        await asyncio.sleep(0.001 * n)
-        elapsed_ms = (time.time() - start) * 1000
-        avg_per_uav = round(elapsed_ms / n, 3) if n > 0 else 0
-        return {
-            "processed_uavs": n,
-            "post_time_ms": round(elapsed_ms, 3),
-            "avg_post_per_uav_ms": avg_per_uav,
-            "collisions_detected": len(collision_pairs),
-            "collision_pairs": collision_pairs,
-        }
-    finally:
-        session.close()
+    # -------- 1) Normal movement --------
+    for u in rows:
+        if u.system_case == "transfer":
+            # linear traveling progress
+            u.progress += 0.07
 
-# =====================================================
-# 🤖 تنبؤ التصادمات + تجنّبها (Cloud Analytics)
-# =====================================================
-@app.post("/city/{city}/predict")
-async def predict_and_avoid(city: str):
-    session = SessionLocal()
-    start = time.time()
-    try:
-        uavs = session.query(uav_table).filter_by(city_name=city).all()
-        n = len(uavs)
-        if n == 0:
-            return {"message": "No UAVs found for prediction."}
+            # Move in straight line toward Basra (example)
+            u.x += STEP_SCALE * u.speed
+            u.y += STEP_SCALE * u.speed
 
-        Δt = 5.0  # زمن التنبؤ (ثوانٍ)
-        collision_threshold = 0.05  # مسافة الخطر (درجات تقريباً ~5م)
-        collision_pairs = []
-        adjusted = []
+            if u.progress >= 1.0:
+                # move UAV officially to Basra
+                u.city = u.target_city
+                u.system_case = "normal"
 
-        # توليد اتجاه عشوائي وسرعة مستقبلية
-        for u in uavs:
-            angle = random.uniform(0, 2 * pi)
-            u.vx = u.speed * cos(angle) / 100
-            u.vy = u.speed * sin(angle) / 100
-            u.x_future = u.x + u.vx * Δt
-            u.y_future = u.y + u.vy * Δt
+        else:
+            # Normal random movement inside city
+            u.direction = random.uniform(-pi, pi)
+            u.x += u.speed * STEP_SCALE * cos(u.direction)
+            u.y += u.speed * STEP_SCALE * sin(u.direction)
 
-        # 🔍 التنبؤ بالتصادمات
-        for i in range(n):
-            for j in range(i + 1, n):
-                dist = sqrt(
-                    (uavs[i].x_future - uavs[j].x_future) ** 2
-                    + (uavs[i].y_future - uavs[j].y_future) ** 2
-                )
-                if dist < collision_threshold:
-                    collision_pairs.append([uavs[i].uav_id, uavs[j].uav_id])
-                    # تعديل الارتفاع لتجنّب التصادم
-                    uavs[i].altitude += 10
-                    uavs[j].altitude -= 10
-                    adjusted.append((uavs[i].uav_id, uavs[j].uav_id))
+        clamp_position(u)
 
-        # تحديث قاعدة البيانات بعد التنبؤ
-        for u in uavs:
-            stmt = uav_table.update().where(
-                (uav_table.c.city_name == city)
-                & (uav_table.c.uav_id == u.uav_id)
-            ).values(
-                x=u.x_future,
-                y=u.y_future,
-                altitude=u.altitude,
-                system_case="avoidance"
-                if u.uav_id in sum(collision_pairs, ())
-                else "normal",
-            )
-            session.execute(stmt)
-        session.commit()
+    # -------- 2) Avoidance (simple) --------
+    # (يمكن تحديثه إلى B+C مثل جزءك)
+    for i in range(len(rows)):
+        for j in range(i+1, len(rows)):
+            u1 = rows[i]
+            u2 = rows[j]
 
-        elapsed_ms = (time.time() - start) * 1000
-        return {
-            "processed_uavs": n,
-            "predicted_collisions": len(collision_pairs),
-            "adjusted_pairs": len(adjusted),
-            "collision_pairs": collision_pairs,
-            "execution_time_ms": round(elapsed_ms, 2),
-        }
-    finally:
-        session.close()
+            d = dist3(u1, u2)
 
-# =====================================================
-# 🌍 تشغيل السيرفر (على Render)
-# =====================================================
-@app.get("/")
-def home():
-    return {
-        "status": "✅ Server Online",
-        "message": "UAV Cloud Simulation API is running successfully!",
-        "available_endpoints": [
-            "/city/{city}/uav  → PUT (upload UAV data)",
-            "/city/{city}/uavs → GET (retrieve UAVs)",
-            "/city/{city}/process → POST (analyze collisions)",
-            "/city/{city}/predict → POST (predict & avoid collisions)"
-        ]
-    }
+            if d < COLLISION_THRESHOLD * NEAR_FACTOR:
+                ang = atan2(u2.y - u1.y, u2.x - u1.x)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+                # opposite directions
+                u1.direction = ang - pi/2
+                u2.direction = ang + pi/2
+
+                # slow down slightly
+                u1.speed *= 0.85
+                u2.speed *= 0.85
+
+                u1.x += 0.02 * cos(u1.direction)
+                u1.y += 0.02 * sin(u1.direction)
+
+                u2.x += 0.02 * cos(u2.direction)
+                u2.y += 0.02 * sin(u2.direction)
+
+                u1.system_case = "avoidance"
+                u2.system_case = "avoidance"
+
+                clamp_position(u1)
+                clamp_position(u2)
+
+    s.commit()
+
+    return {"processed": len(rows)}
+
